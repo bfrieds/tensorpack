@@ -427,6 +427,8 @@ class HorovodTrainer(SingleCostTrainer):
         return averaged_gradients
 
     def _setup_graph(self, input, get_cost_fn, get_opt_fn):
+        pid = os.getpid()
+        debug_var_idx = 0
         with TrainTowerContext(''):
             self.grads = self._make_get_grad_fn(input, get_cost_fn, get_opt_fn)()
             aggregation_ops_list = []
@@ -447,13 +449,20 @@ class HorovodTrainer(SingleCostTrainer):
                     for idx, (grad, var) in enumerate(self.grads):
                         grad_aggregation_variable_name = str(idx)
                         grad_aggregator = tf.get_variable(grad_aggregation_variable_name)
-                        update_op = grad_aggregator.assign_add(grad)
-                        aggregation_ops_list.append(update_op)
-                        self.gpu_shadow_vars[idx] = (self.gpu_shadow_vars[idx][0], var)
+                        with tf.control_dependencies([grad_aggregator, var]):
+                            tfprint = lambda: tf.print("[pid {} Updating gradient]: Prev grad:".format(pid), grad_aggregator, "New grad:", grad, "var:", var)
+                            cond_print_op_2 = tf.cond(tf.equal(idx, debug_var_idx), tfprint, tf.no_op)
+                        with tf.control_dependencies([cond_print_op_2]):
+                            update_op = grad_aggregator.assign_add(grad)
+                            aggregation_ops_list.append(update_op)
+                            self.gpu_shadow_vars[idx] = (self.gpu_shadow_vars[idx][0], var)
+                            with tf.control_dependencies([update_op]):
+                                tfprint = lambda: tf.print("[pid {} Agg gradient]:".format(pid), grad_aggregator)
+                                update_op_print = tf.cond(tf.equal(idx, debug_var_idx), tfprint, tf.no_op)
             aggregation_ops = tf.group(*aggregation_ops_list)
 
             # TODO: Use tf.queue instead of ConditionalAccumulator.
-            with tf.control_dependencies([aggregation_ops]):
+            with tf.control_dependencies([aggregation_ops, update_op_print]):
                 # Using a large local step count so that it's always bigger than global step, which is incremented
                 # every time we call self.counter.take_grad().
                 self.train_op = self.counter.apply_grad(tf.constant([1], dtype=tf.float32), local_step=990000000)
